@@ -1,0 +1,5 @@
+leap-keymanager (0.2.0) unstable; urgency=low
+
+  * Initial debian package
+
+ -- Micah Anderson <micah@leap.se>  Thu, 18 Jul 2013 14:08:30 -0400
