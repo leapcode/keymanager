@@ -1,3 +1,9 @@
+leap-keymanager (0.3.1pre) unstable; urgency=low
+
+  * Merge new version to get soledad split
+
+ -- Micah Anderson <micah@debian.org>  Thu, 22 Aug 2013 15:13:03 -0400
+
 leap-keymanager (0.3.0) unstable; urgency=low
 
   * Update to 0.3.0
