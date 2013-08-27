@@ -1,9 +1,9 @@
 leap-keymanager (0.3.1) unstable; urgency=low
 
-  * Merge new version to get soledad split
+  * Update to 0.3.1
   * Note correct package name for python-leap-common in pydist-overrides
 
- -- Micah Anderson <micah@debian.org>  Thu, 22 Aug 2013 15:13:03 -0400
+ -- Micah Anderson <micah@debian.org>  Tue, 27 Aug 2013 20:12:43 +0200
 
 leap-keymanager (0.3.0) unstable; urgency=low
 
