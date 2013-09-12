@@ -1,3 +1,9 @@
+leap-keymanager (0.3.2) unstable; urgency=low
+
+  * Update to 0.3.2
+
+ -- Micah Anderson <micah@debian.org>  Thu, 12 Sep 2013 14:04:59 +0200
+
 leap-keymanager (0.3.1) unstable; urgency=low
 
   * Update to 0.3.1
