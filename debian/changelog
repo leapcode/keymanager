@@ -1,3 +1,10 @@
+leap-keymanager (0.3.3) unstable; urgency=low
+
+  * Update to 0.3.3
+  * Change dependency to python-gnupg-ng
+
+ -- Micah Anderson <micah@debian.org>  Mon, 14 Oct 2013 03:16:39 -0300
+
 leap-keymanager (0.3.2) unstable; urgency=low
 
   * Update to 0.3.2
