@@ -1,3 +1,10 @@
+leap-keymanager (0.3.4) unstable; urgency=low
+
+  * Update to 0.3.4
+  * Version reported is 0.3.4 using freeze_debianver command.
+
+ -- Micah Anderson <micah@debian.org>  Wed, 30 Oct 2013 15:50:19 -0200
+
 leap-keymanager (0.3.3) unstable; urgency=low
 
   * Update to 0.3.3
