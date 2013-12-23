@@ -1,3 +1,9 @@
+leap-keymanager (0.3.8~rc) unstable; urgency=low
+
+  * Update to 0.3.8 rc release.
+
+ -- Ben Carrillo <ben@futeisha.org>  Mon, 23 Dec 2013 02:21:54 -0400
+
 leap-keymanager (0.3.7) unstable; urgency=low
 
   * Update to 0.3.7 release 
