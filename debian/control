@@ -1,0 +1,13 @@
+Source: leap-keymanager
+Maintainer: Micah Anderson <micah@leap.se>
+Section: python
+Priority: optional
+Build-Depends: python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 9)
+Standards-Version: 3.9.5
+
+Package: leap-keymanager
+Architecture: all
+Depends: ${misc:Depends}, ${python:Depends}
+Description: LEAP's Key Manager
+ The Key Manager handles all types of keys to allow for  point-to-point 
+ encryption between parties communicating  through LEAP infrastructure.

@@ -1,0 +1,62 @@
+leap-keymanager (0.3.8) unstable; urgency=low
+
+  * Update to 0.3.8 release.
+
+ -- Ben Carrillo <ben@futeisha.org>  Wed, 09 Apr 2014 14:39:30 -0500
+
+leap-keymanager (0.3.7) unstable; urgency=low
+
+  * Update to 0.3.7 release 
+
+ -- Ben Carrillo <ben@futeisha.org>  Tue, 10 Dec 2013 16:21:13 -0400
+
+leap-keymanager (0.3.6) unstable; urgency=low
+
+  * Update to 0.3.6 release.
+
+ -- Ben Carrillo <ben@futeisha.org>  Fri, 15 Nov 2013 23:32:40 -0200
+
+leap-keymanager (0.3.5) unstable; urgency=low
+
+  * Update to 0.3.5 release.
+
+ -- Ben Carrillo <ben@futeisha.org>  Tue, 05 Nov 2013 11:13:40 -0200
+
+leap-keymanager (0.3.4) unstable; urgency=low
+
+  * Update to 0.3.4
+  * Version reported is 0.3.4 using freeze_debianver command.
+
+ -- Micah Anderson <micah@debian.org>  Wed, 30 Oct 2013 15:50:19 -0200
+
+leap-keymanager (0.3.3) unstable; urgency=low
+
+  * Update to 0.3.3
+  * Change dependency to python-gnupg-ng
+
+ -- Micah Anderson <micah@debian.org>  Mon, 14 Oct 2013 03:16:39 -0300
+
+leap-keymanager (0.3.2) unstable; urgency=low
+
+  * Update to 0.3.2
+
+ -- Micah Anderson <micah@debian.org>  Thu, 12 Sep 2013 14:04:59 +0200
+
+leap-keymanager (0.3.1) unstable; urgency=low
+
+  * Update to 0.3.1
+  * Note correct package name for python-leap-common in pydist-overrides
+
+ -- Micah Anderson <micah@debian.org>  Tue, 27 Aug 2013 20:12:43 +0200
+
+leap-keymanager (0.3.0) unstable; urgency=low
+
+  * Update to 0.3.0
+
+ -- Micah Anderson <micah@leap.se>  Tue, 13 Aug 2013 15:44:26 -0400
+
+leap-keymanager (0.2.0) unstable; urgency=low
+
+  * Initial debian package
+
+ -- Micah Anderson <micah@leap.se>  Thu, 18 Jul 2013 14:08:30 -0400
