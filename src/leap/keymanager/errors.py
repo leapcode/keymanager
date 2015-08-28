@@ -96,3 +96,15 @@ class KeyFingerprintMismatch(Exception):
     """
     A mismatch between fingerprints.
     """
+
+
+class KeyNotValidUpgrade(Exception):
+    """
+    Already existing key can not be upgraded with the new key
+    """
+
+
+class UnsupportedKeyTypeError(Exception):
+    """
+    Invalid key type
+    """

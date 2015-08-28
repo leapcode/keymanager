@@ -20,14 +20,16 @@ setup file for leap.keymanager
 import re
 from setuptools import setup
 from setuptools import find_packages
+from setuptools import Command
+
+from pkg import utils
+
 
 import versioneer
 versioneer.versionfile_source = 'src/leap/keymanager/_version.py'
 versioneer.versionfile_build = 'leap/keymanager/_version.py'
 versioneer.tag_prefix = ''  # tags are like 1.2.0
 versioneer.parentdir_prefix = 'leap.keymanager-'
-
-from pkg import utils
 
 trove_classifiers = [
     'Development Status :: 4 - Beta',
@@ -57,9 +59,6 @@ if len(_version_short) > 0:
     DOWNLOAD_URL = DOWNLOAD_BASE % VERSION_SHORT
 
 cmdclass = versioneer.get_cmdclass()
-
-
-from setuptools import Command
 
 
 class freeze_debianver(Command):
@@ -107,6 +106,22 @@ cmdclass["freeze_debianver"] = freeze_debianver
 
 # XXX add ref to docs
 
+requirements = utils.parse_requirements()
+
+if utils.is_develop_mode():
+    print
+    print ("[WARNING] Skipping leap-specific dependencies "
+           "because development mode is detected.")
+    print ("[WARNING] You can install "
+           "the latest published versions with "
+           "'pip install -r pkg/requirements-leap.pip'")
+    print ("[WARNING] Or you can instead do 'python setup.py develop' "
+           "from the parent folder of each one of them.")
+    print
+else:
+    requirements += utils.parse_requirements(
+        reqfiles=["pkg/requirements-leap.pip"])
+
 setup(
     name='leap.keymanager',
     version=VERSION,
@@ -129,7 +144,7 @@ setup(
     packages=find_packages('src', exclude=['leap.keymanager.tests']),
     package_dir={'': 'src'},
     test_suite='leap.keymanager.tests',
-    install_requires=utils.parse_requirements(),
+    install_requires=requirements,
     tests_require=utils.parse_requirements(
         reqfiles=['pkg/requirements-testing.pip']),
 )

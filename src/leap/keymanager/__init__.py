@@ -19,18 +19,26 @@ Key Manager is a Nicknym agent for LEAP client.
 """
 # let's do a little sanity check to see if we're using the wrong gnupg
 import sys
+from ._version import get_versions
 
 try:
     from gnupg.gnupg import GPGUtilities
     assert(GPGUtilities)  # pyflakes happy
     from gnupg import __version__ as _gnupg_version
+    if '-' in _gnupg_version:
+        # avoid Parsing it as LegacyVersion, get just
+        # the release numbers:
+        _gnupg_version = _gnupg_version.split('-')[0]
     from pkg_resources import parse_version
-    assert(parse_version(_gnupg_version) >= parse_version('1.2.3'))
+    # We need to make sure that we're not colliding with the infamous
+    # python-gnupg
+    assert(parse_version(_gnupg_version) >= parse_version('1.4.0'))
 
 except (ImportError, AssertionError):
     print "*******"
     print "Ooops! It looks like there is a conflict in the installed version "
     print "of gnupg."
+    print "GNUPG_VERSION:", _gnupg_version
     print
     print "Disclaimer: Ideally, we would need to work a patch and propose the "
     print "merge to upstream. But until then do: "
@@ -43,23 +51,33 @@ except (ImportError, AssertionError):
 import logging
 import requests
 
-from leap.common.check import leap_assert, leap_assert_type
-from leap.common.events import signal
-from leap.common.events import events_pb2 as proto
+from twisted.internet import defer
+from urlparse import urlparse
+
+from leap.common.check import leap_assert
+from leap.common.events import emit, catalog
 from leap.common.decorators import memoized_method
 
-from leap.keymanager.errors import KeyNotFound
+from leap.keymanager.errors import (
+    KeyNotFound,
+    KeyAddressMismatch,
+    KeyNotValidUpgrade,
+    UnsupportedKeyTypeError,
+    InvalidSignature
+)
+from leap.keymanager.validation import ValidationLevels, can_upgrade
 
 from leap.keymanager.keys import (
-    EncryptionKey,
     build_key_from_dict,
     KEYMANAGER_KEY_TAG,
     TAGS_PRIVATE_INDEX,
 )
-from leap.keymanager.openpgp import (
-    OpenPGPKey,
-    OpenPGPScheme,
-)
+from leap.keymanager.openpgp import OpenPGPKey, OpenPGPScheme
+
+from ._version import get_versions
+
+__version__ = get_versions()['version']
+del get_versions
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +100,12 @@ class KeyManager(object):
                  gpgbinary=None):
         """
         Initialize a Key Manager for user's C{address} with provider's
-        nickserver reachable in C{url}.
+        nickserver reachable in C{nickserver_uri}.
 
-        :param address: The address of the user of this Key Manager.
+        :param address: The email address of the user of this Key Manager.
         :type address: str
-        :param url: The URL of the nickserver.
-        :type url: str
+        :param nickserver_uri: The URI of the nickserver.
+        :type nickserver_uri: str
         :param soledad: A Soledad instance for local storage of keys.
         :type soledad: leap.soledad.Soledad
         :param token: The token for interacting with the webapp API.
@@ -98,7 +116,7 @@ class KeyManager(object):
         :type api_uri: str
         :param api_version: The version of the webapp API.
         :type api_version: str
-        :param uid: The users' UID.
+        :param uid: The user's UID.
         :type uid: str
         :param gpgbinary: Name for GnuPG binary executable.
         :type gpgbinary: C{str}
@@ -129,7 +147,7 @@ class KeyManager(object):
         Return key class from string representation of key type.
         """
         return filter(
-            lambda klass: str(klass) == ktype,
+            lambda klass: klass.__name__ == ktype,
             self._wrapper_map).pop()
 
     def _get(self, uri, data=None):
@@ -189,33 +207,54 @@ class KeyManager(object):
         res.raise_for_status()
         return res
 
+    @memoized_method(invalidation=300)
     def _fetch_keys_from_server(self, address):
         """
-        Fetch keys bound to C{address} from nickserver and insert them in
+        Fetch keys bound to address from nickserver and insert them in
         local database.
 
         :param address: The address bound to the keys.
         :type address: str
 
-        :raise KeyNotFound: If the key was not found on nickserver.
+        :return: A Deferred which fires when the key is in the storage,
+                 or which fails with KeyNotFound if the key was not found on
+                 nickserver.
+        :rtype: Deferred
+
         """
         # request keys from the nickserver
+        d = defer.succeed(None)
         res = None
         try:
             res = self._get(self._nickserver_uri, {'address': address})
             res.raise_for_status()
             server_keys = res.json()
+
             # insert keys in local database
             if self.OPENPGP_KEY in server_keys:
-                self._wrapper_map[OpenPGPKey].put_ascii_key(
-                    server_keys['openpgp'])
+                # nicknym server is authoritative for its own domain,
+                # for other domains the key might come from key servers.
+                validation_level = ValidationLevels.Weak_Chain
+                _, domain = _split_email(address)
+                if (domain == _get_domain(self._nickserver_uri)):
+                    validation_level = ValidationLevels.Provider_Trust
+
+                d = self.put_raw_key(
+                    server_keys['openpgp'],
+                    OpenPGPKey,
+                    address=address,
+                    validation=validation_level)
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                raise KeyNotFound(address)
+                d = defer.fail(KeyNotFound(address))
+            else:
+                d = defer.fail(KeyNotFound(e.message))
             logger.warning("HTTP error retrieving key: %r" % (e,))
             logger.warning("%s" % (res.content,))
         except Exception as e:
+            d = defer.fail(KeyNotFound(e.message))
             logger.warning("Error retrieving key: %r" % (e,))
+        return d
 
     #
     # key management
@@ -223,48 +262,41 @@ class KeyManager(object):
 
     def send_key(self, ktype):
         """
-        Send user's key of type C{ktype} to provider.
+        Send user's key of type ktype to provider.
 
         Public key bound to user's is sent to provider, which will sign it and
         replace any prior keys for the same address in its database.
 
-        If C{send_private} is True, then the private key is encrypted with
-        C{password} and sent to server in the same request, together with a
-        hash string of user's address and password. The encrypted private key
-        will be saved in the server in a way it is publicly retrievable
-        through the hash string.
-
         :param ktype: The type of the key.
-        :type ktype: KeyType
+        :type ktype: subclass of EncryptionKey
 
-        :raise KeyNotFound: If the key was not found in local database.
+        :return: A Deferred which fires when the key is sent, or which fails
+                 with KeyNotFound if the key was not found in local database.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        leap_assert(
-            ktype is OpenPGPKey,
-            'For now we only know how to send OpenPGP public keys.')
-        # prepare the public key bound to address
-        pubkey = self.get_key(
+        self._assert_supported_key_type(ktype)
+
+        def send(pubkey):
+            data = {
+                self.PUBKEY_KEY: pubkey.key_data
+            }
+            uri = "%s/%s/users/%s.json" % (
+                self._api_uri,
+                self._api_version,
+                self._uid)
+            self._put(uri, data)
+            emit(catalog.KEYMANAGER_DONE_UPLOADING_KEYS, self._address)
+
+        d = self.get_key(
             self._address, ktype, private=False, fetch_remote=False)
-        data = {
-            self.PUBKEY_KEY: pubkey.key_data
-        }
-        uri = "%s/%s/users/%s.json" % (
-            self._api_uri,
-            self._api_version,
-            self._uid)
-        self._put(uri, data)
-        signal(proto.KEYMANAGER_DONE_UPLOADING_KEYS, self._address)
-
-    @memoized_method
-    def get_key_from_cache(self, *args, **kwargs):
-        """
-        Public interface to `get_key`, that is memoized.
-        """
-        return self.get_key(*args, **kwargs)
+        d.addCallback(send)
+        return d
 
     def get_key(self, address, ktype, private=False, fetch_remote=True):
         """
-        Return a key of type C{ktype} bound to C{address}.
+        Return a key of type ktype bound to address.
 
         First, search for the key in local storage. If it is not available,
         then try to fetch from nickserver.
@@ -272,86 +304,106 @@ class KeyManager(object):
         :param address: The address bound to the key.
         :type address: str
         :param ktype: The type of the key.
-        :type ktype: KeyType
+        :type ktype: subclass of EncryptionKey
         :param private: Look for a private key instead of a public one?
         :type private: bool
+        :param fetch_remote: If key not found in local storage try to fetch
+                             from nickserver
+        :type fetch_remote: bool
 
-        :return: A key of type C{ktype} bound to C{address}.
-        :rtype: EncryptionKey
-        :raise KeyNotFound: If the key was not found both locally and in
-                            keyserver.
+        :return: A Deferred which fires with an EncryptionKey of type ktype
+                 bound to address, or which fails with KeyNotFound if no key
+                 was found neither locally or in keyserver.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
+        self._assert_supported_key_type(ktype)
         logger.debug("getting key for %s" % (address,))
         leap_assert(
             ktype in self._wrapper_map,
             'Unkown key type: %s.' % str(ktype))
-        try:
-            signal(proto.KEYMANAGER_LOOKING_FOR_KEY, address)
-            # return key if it exists in local database
-            key = self._wrapper_map[ktype].get_key(address, private=private)
-            signal(proto.KEYMANAGER_KEY_FOUND, address)
+        emit(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
 
+        def key_found(key):
+            emit(catalog.KEYMANAGER_KEY_FOUND, address)
             return key
-        except KeyNotFound:
-            signal(proto.KEYMANAGER_KEY_NOT_FOUND, address)
+
+        def key_not_found(failure):
+            if not failure.check(KeyNotFound):
+                return failure
+
+            emit(catalog.KEYMANAGER_KEY_NOT_FOUND, address)
 
             # we will only try to fetch a key from nickserver if fetch_remote
             # is True and the key is not private.
             if fetch_remote is False or private is True:
-                raise
+                return failure
 
-            signal(proto.KEYMANAGER_LOOKING_FOR_KEY, address)
-            self._fetch_keys_from_server(address)  # might raise KeyNotFound
-            key = self._wrapper_map[ktype].get_key(address, private=False)
-            signal(proto.KEYMANAGER_KEY_FOUND, address)
+            emit(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
+            d = self._fetch_keys_from_server(address)
+            d.addCallback(
+                lambda _:
+                self._wrapper_map[ktype].get_key(address, private=False))
+            d.addCallback(key_found)
+            return d
 
-            return key
+        # return key if it exists in local database
+        d = self._wrapper_map[ktype].get_key(address, private=private)
+        d.addCallbacks(key_found, key_not_found)
+        return d
 
-    def get_all_keys_in_local_db(self, private=False):
+    def get_all_keys(self, private=False):
         """
         Return all keys stored in local database.
 
-        :return: A list with all keys in local db.
-        :rtype: list
-        """
-        return map(
-            lambda doc: build_key_from_dict(
-                self._key_class_from_type(doc.content['type']),
-                doc.content['address'],
-                doc.content),
-            self._soledad.get_from_index(
-                TAGS_PRIVATE_INDEX,
-                KEYMANAGER_KEY_TAG,
-                '1' if private else '0'))
+        :param private: Include private keys
+        :type private: bool
 
-    def refresh_keys(self):
+        :return: A Deferred which fires with a list of all keys in local db.
+        :rtype: Deferred
         """
-        Fetch keys from nickserver and update them locally.
-        """
-        addresses = set(map(
-            lambda doc: doc.address,
-            self.get_all_keys_in_local_db(private=False)))
-        for address in addresses:
-            # do not attempt to refresh our own key
-            if address == self._address:
-                continue
-            self._fetch_keys_from_server(address)
+        def build_keys(docs):
+            return map(
+                lambda doc: build_key_from_dict(
+                    self._key_class_from_type(doc.content['type']),
+                    doc.content),
+                docs)
+
+        # XXX: there is no check that the soledad indexes are ready, as it
+        #      happens with EncryptionScheme.
+        #      The usecases right now are not problematic. This could be solve
+        #      adding a keytype to this funciont and moving the soledad request
+        #      to the EncryptionScheme.
+        d = self._soledad.get_from_index(
+            TAGS_PRIVATE_INDEX,
+            KEYMANAGER_KEY_TAG,
+            '1' if private else '0')
+        d.addCallback(build_keys)
+        return d
 
     def gen_key(self, ktype):
         """
-        Generate a key of type C{ktype} bound to the user's address.
+        Generate a key of type ktype bound to the user's address.
 
         :param ktype: The type of the key.
-        :type ktype: KeyType
+        :type ktype: subclass of EncryptionKey
 
-        :return: The generated key.
-        :rtype: EncryptionKey
+        :return: A Deferred which fires with the generated EncryptionKey.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        signal(proto.KEYMANAGER_STARTED_KEY_GENERATION, self._address)
-        key = self._wrapper_map[ktype].gen_key(self._address)
-        signal(proto.KEYMANAGER_FINISHED_KEY_GENERATION, self._address)
+        self._assert_supported_key_type(ktype)
 
-        return key
+        def signal_finished(key):
+            emit(catalog.KEYMANAGER_FINISHED_KEY_GENERATION, self._address)
+            return key
+
+        emit(catalog.KEYMANAGER_STARTED_KEY_GENERATION, self._address)
+        d = self._wrapper_map[ktype].gen_key(self._address)
+        d.addCallback(signal_finished)
+        return d
 
     #
     # Setters/getters
@@ -407,67 +459,132 @@ class KeyManager(object):
     # encrypt/decrypt and sign/verify API
     #
 
-    def encrypt(self, data, pubkey, passphrase=None, sign=None,
-                cipher_algo='AES256'):
+    def encrypt(self, data, address, ktype, passphrase=None, sign=None,
+                cipher_algo='AES256', fetch_remote=True):
         """
-        Encrypt C{data} using public @{key} and sign with C{sign} key.
+        Encrypt data with the public key bound to address and sign with with
+        the private key bound to sign address.
 
         :param data: The data to be encrypted.
         :type data: str
-        :param pubkey: The key used to encrypt.
-        :type pubkey: EncryptionKey
-        :param sign: The key used for signing.
-        :type sign: EncryptionKey
+        :param address: The address to encrypt it for.
+        :type address: str
+        :param ktype: The type of the key.
+        :type ktype: subclass of EncryptionKey
+        :param passphrase: The passphrase for the secret key used for the
+                           signature.
+        :type passphrase: str
+        :param sign: The address to be used for signature.
+        :type sign: str
         :param cipher_algo: The cipher algorithm to use.
         :type cipher_algo: str
+        :param fetch_remote: If key is not found in local storage try to fetch
+                             from nickserver
+        :type fetch_remote: bool
 
-        :return: The encrypted data.
-        :rtype: str
-        """
-        leap_assert_type(pubkey, EncryptionKey)
-        leap_assert(pubkey.__class__ in self._wrapper_map, 'Unknown key type.')
-        leap_assert(pubkey.private is False, 'Key is not public.')
-        return self._wrapper_map[pubkey.__class__].encrypt(
-            data, pubkey, passphrase, sign)
+        :return: A Deferred which fires with the encrypted data as str, or
+                 which fails with KeyNotFound if no keys were found neither
+                 locally or in keyserver or fails with EncryptError if failed
+                 encrypting for some reason.
+        :rtype: Deferred
 
-    def decrypt(self, data, privkey, passphrase=None, verify=None):
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        Decrypt C{data} using private @{privkey} and verify with C{verify} key.
+        self._assert_supported_key_type(ktype)
+
+        def encrypt(keys):
+            pubkey, signkey = keys
+            encrypted = self._wrapper_map[ktype].encrypt(
+                data, pubkey, passphrase, sign=signkey,
+                cipher_algo=cipher_algo)
+            pubkey.encr_used = True
+            d = self._wrapper_map[ktype].put_key(pubkey, address)
+            d.addCallback(lambda _: encrypted)
+            return d
+
+        dpub = self.get_key(address, ktype, private=False,
+                            fetch_remote=fetch_remote)
+        dpriv = defer.succeed(None)
+        if sign is not None:
+            dpriv = self.get_key(sign, ktype, private=True)
+        d = defer.gatherResults([dpub, dpriv], consumeErrors=True)
+        d.addCallbacks(encrypt, self._extract_first_error)
+        return d
+
+    def decrypt(self, data, address, ktype, passphrase=None, verify=None,
+                fetch_remote=True):
+        """
+        Decrypt data using private key from address and verify with public key
+        bound to verify address.
 
         :param data: The data to be decrypted.
         :type data: str
-        :param privkey: The key used to decrypt.
-        :type privkey: OpenPGPKey
+        :param address: The address to whom data was encrypted.
+        :type address: str
+        :param ktype: The type of the key.
+        :type ktype: subclass of EncryptionKey
         :param passphrase: The passphrase for the secret key used for
                            decryption.
         :type passphrase: str
-        :param verify: The key used to verify a signature.
-        :type verify: OpenPGPKey
+        :param verify: The address to be used for signature.
+        :type verify: str
+        :param fetch_remote: If key for verify not found in local storage try
+                             to fetch from nickserver
+        :type fetch_remote: bool
 
-        :return: The decrypted data.
-        :rtype: str
+        :return: A Deferred which fires with:
+            * (decripted str, signing key) if validation works
+            * (decripted str, KeyNotFound) if signing key not found
+            * (decripted str, InvalidSignature) if signature is invalid
+            * KeyNotFound failure if private key not found
+            * DecryptError failure if decription failed
+        :rtype: Deferred
 
-        :raise InvalidSignature: Raised if unable to verify the signature with
-            C{verify} key.
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        leap_assert_type(privkey, EncryptionKey)
-        leap_assert(
-            privkey.__class__ in self._wrapper_map,
-            'Unknown key type.')
-        leap_assert(privkey.private is True, 'Key is not private.')
-        return self._wrapper_map[privkey.__class__].decrypt(
-            data, privkey, passphrase, verify)
+        self._assert_supported_key_type(ktype)
 
-    def sign(self, data, privkey, digest_algo='SHA512', clearsign=False,
+        def decrypt(keys):
+            pubkey, privkey = keys
+            decrypted, signed = self._wrapper_map[ktype].decrypt(
+                data, privkey, passphrase=passphrase, verify=pubkey)
+            if pubkey is None:
+                signature = KeyNotFound(verify)
+            elif signed:
+                pubkey.sign_used = True
+                d = self._wrapper_map[ktype].put_key(pubkey, address)
+                d.addCallback(lambda _: (decrypted, pubkey))
+                return d
+            else:
+                signature = InvalidSignature(
+                    'Failed to verify signature with key %s' %
+                    (pubkey.key_id,))
+            return (decrypted, signature)
+
+        dpriv = self.get_key(address, ktype, private=True)
+        dpub = defer.succeed(None)
+        if verify is not None:
+            dpub = self.get_key(verify, ktype, private=False,
+                                fetch_remote=fetch_remote)
+            dpub.addErrback(lambda f: None if f.check(KeyNotFound) else f)
+        d = defer.gatherResults([dpub, dpriv], consumeErrors=True)
+        d.addCallbacks(decrypt, self._extract_first_error)
+        return d
+
+    def _extract_first_error(self, failure):
+        return failure.value.subFailure
+
+    def sign(self, data, address, ktype, digest_algo='SHA512', clearsign=False,
              detach=True, binary=False):
         """
-        Sign C{data} with C{privkey}.
+        Sign data with private key bound to address.
 
         :param data: The data to be signed.
         :type data: str
-
-        :param privkey: The private key to be used to sign.
-        :type privkey: EncryptionKey
+        :param address: The address to be used to sign.
+        :type address: EncryptionKey
+        :param ktype: The type of the key.
+        :type ktype: subclass of EncryptionKey
         :param digest_algo: The hash digest to use.
         :type digest_algo: str
         :param clearsign: If True, create a cleartext signature.
@@ -477,82 +594,240 @@ class KeyManager(object):
         :param binary: If True, do not ascii armour the output.
         :type binary: bool
 
-        :return: The signed data.
-        :rtype: str
-        """
-        leap_assert_type(privkey, EncryptionKey)
-        leap_assert(
-            privkey.__class__ in self._wrapper_map,
-            'Unknown key type.')
-        leap_assert(privkey.private is True, 'Key is not private.')
-        return self._wrapper_map[privkey.__class__].sign(
-            data, privkey, digest_algo=digest_algo, clearsign=clearsign,
-            detach=detach, binary=binary)
+        :return: A Deferred which fires with the signed data as str or fails
+                 with KeyNotFound if no key was found neither locally or in
+                 keyserver or fails with SignFailed if there was any error
+                 signing.
+        :rtype: Deferred
 
-    def verify(self, data, pubkey, detached_sig=None):
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        Verify signed C{data} with C{pubkey}, eventually using
-        C{detached_sig}.
+        self._assert_supported_key_type(ktype)
+
+        def sign(privkey):
+            return self._wrapper_map[ktype].sign(
+                data, privkey, digest_algo=digest_algo, clearsign=clearsign,
+                detach=detach, binary=binary)
+
+        d = self.get_key(address, ktype, private=True)
+        d.addCallback(sign)
+        return d
+
+    def verify(self, data, address, ktype, detached_sig=None,
+               fetch_remote=True):
+        """
+        Verify signed data with private key bound to address, eventually using
+        detached_sig.
 
         :param data: The data to be verified.
         :type data: str
-        :param pubkey: The public key to be used on verification.
-        :type pubkey: EncryptionKey
+        :param address: The address to be used to verify.
+        :type address: EncryptionKey
+        :param ktype: The type of the key.
+        :type ktype: subclass of EncryptionKey
         :param detached_sig: A detached signature. If given, C{data} is
                              verified using this detached signature.
         :type detached_sig: str
+        :param fetch_remote: If key for verify not found in local storage try
+                             to fetch from nickserver
+        :type fetch_remote: bool
 
-        :return: The signed data.
-        :rtype: str
+        :return: A Deferred which fires with the signing EncryptionKey if
+                 signature verifies, or which fails with InvalidSignature if
+                 signature don't verifies or fails with KeyNotFound if no key
+                 was found neither locally or in keyserver.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        leap_assert_type(pubkey, EncryptionKey)
-        leap_assert(pubkey.__class__ in self._wrapper_map, 'Unknown key type.')
-        leap_assert(pubkey.private is False, 'Key is not public.')
-        return self._wrapper_map[pubkey.__class__].verify(
-            data, pubkey, detached_sig=detached_sig)
+        self._assert_supported_key_type(ktype)
 
-    def parse_openpgp_ascii_key(self, key_data):
-        """
-        Parses an ascii armored key (or key pair) data and returns
-        the OpenPGPKey keys.
+        def verify(pubkey):
+            signed = self._wrapper_map[ktype].verify(
+                data, pubkey, detached_sig=detached_sig)
+            if signed:
+                pubkey.sign_used = True
+                d = self._wrapper_map[ktype].put_key(pubkey, address)
+                d.addCallback(lambda _: pubkey)
+                return d
+            else:
+                raise InvalidSignature(
+                    'Failed to verify signature with key %s' %
+                    (pubkey.key_id,))
 
-        :param key_data: the key data to be parsed.
-        :type key_data: str or unicode
-
-        :returns: the public key and private key (if applies) for that data.
-        :rtype: (public, private) -> tuple(OpenPGPKey, OpenPGPKey)
-                the tuple may have one or both components None
-        """
-        return self._wrapper_map[OpenPGPKey].parse_ascii_key(key_data)
+        d = self.get_key(address, ktype, private=False,
+                         fetch_remote=fetch_remote)
+        d.addCallback(verify)
+        return d
 
     def delete_key(self, key):
         """
-        Remove C{key} from storage.
-
-        May raise:
-            openpgp.errors.KeyNotFound
-            openpgp.errors.KeyAttributesDiffer
+        Remove key from storage.
 
         :param key: The key to be removed.
         :type key: EncryptionKey
-        """
-        try:
-            self._wrapper_map[type(key)].delete_key(key)
-        except IndexError as e:
-            leap_assert(False, "Unsupported key type. Error {0!r}".format(e))
 
-    def put_key(self, key):
-        """
-        Put C{key} in local storage.
+        :return: A Deferred which fires when the key is deleted, or which fails
+                 KeyNotFound if the key was not found on local storage.
+        :rtype: Deferred
 
-        :param key: The key to be stored.
-        :type key: OpenPGPKey
+        :raise UnsupportedKeyTypeError: if invalid key type
         """
-        try:
-            self._wrapper_map[type(key)].put_key(key)
-        except IndexError as e:
-            leap_assert(False, "Unsupported key type. Error {0!r}".format(e))
+        self._assert_supported_key_type(type(key))
+        return self._wrapper_map[type(key)].delete_key(key)
 
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions
+    def put_key(self, key, address):
+        """
+        Put key bound to address in local storage.
+
+        :param key: The key to be stored
+        :type key: EncryptionKey
+        :param address: address for which this key will be active
+        :type address: str
+
+        :return: A Deferred which fires when the key is in the storage, or
+                 which fails with KeyAddressMismatch if address doesn't match
+                 any uid on the key or fails with KeyNotValidUpdate if a key
+                 with the same uid exists and the new one is not a valid update
+                 for it.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
+        """
+        self._assert_supported_key_type(type(key))
+
+        if address not in key.address:
+            return defer.fail(
+                KeyAddressMismatch("UID %s found, but expected %s"
+                                   % (str(key.address), address)))
+
+        def old_key_not_found(failure):
+            if failure.check(KeyNotFound):
+                return None
+            else:
+                return failure
+
+        def check_upgrade(old_key):
+            if key.private or can_upgrade(key, old_key):
+                return self._wrapper_map[type(key)].put_key(key, address)
+            else:
+                raise KeyNotValidUpgrade(
+                    "Key %s can not be upgraded by new key %s"
+                    % (old_key.key_id, key.key_id))
+
+        d = self._wrapper_map[type(key)].get_key(address,
+                                                 private=key.private)
+        d.addErrback(old_key_not_found)
+        d.addCallback(check_upgrade)
+        return d
+
+    def put_raw_key(self, key, ktype, address,
+                    validation=ValidationLevels.Weak_Chain):
+        """
+        Put raw key bound to address in local storage.
+
+        :param key: The ascii key to be stored
+        :type key: str
+        :param ktype: the type of the key.
+        :type ktype: subclass of EncryptionKey
+        :param address: address for which this key will be active
+        :type address: str
+        :param validation: validation level for this key
+                           (default: 'Weak_Chain')
+        :type validation: ValidationLevels
+
+        :return: A Deferred which fires when the key is in the storage, or
+                 which fails with KeyAddressMismatch if address doesn't match
+                 any uid on the key or fails with KeyNotValidUpdate if a key
+                 with the same uid exists and the new one is not a valid update
+                 for it.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
+        """
+        self._assert_supported_key_type(ktype)
+        pubkey, privkey = self._wrapper_map[ktype].parse_ascii_key(key)
+        pubkey.validation = validation
+        d = self.put_key(pubkey, address)
+        if privkey is not None:
+            d.addCallback(lambda _: self.put_key(privkey, address))
+        return d
+
+    def fetch_key(self, address, uri, ktype,
+                  validation=ValidationLevels.Weak_Chain):
+        """
+        Fetch a public key bound to address from the network and put it in
+        local storage.
+
+        :param address: The email address of the key.
+        :type address: str
+        :param uri: The URI of the key.
+        :type uri: str
+        :param ktype: the type of the key.
+        :type ktype: subclass of EncryptionKey
+        :param validation: validation level for this key
+                           (default: 'Weak_Chain')
+        :type validation: ValidationLevels
+
+        :return: A Deferred which fires when the key is in the storage, or
+                 which fails with KeyNotFound: if not valid key on uri or fails
+                 with KeyAddressMismatch if address doesn't match any uid on
+                 the key or fails with KeyNotValidUpdate if a key with the same
+                 uid exists and the new one is not a valid update for it.
+        :rtype: Deferred
+
+        :raise UnsupportedKeyTypeError: if invalid key type
+        """
+        self._assert_supported_key_type(ktype)
+
+        res = self._get(uri)
+        if not res.ok:
+            return defer.fail(KeyNotFound(uri))
+
+        # XXX parse binary keys
+        pubkey, _ = self._wrapper_map[ktype].parse_ascii_key(res.content)
+        if pubkey is None:
+            return defer.fail(KeyNotFound(uri))
+
+        pubkey.validation = validation
+        return self.put_key(pubkey, address)
+
+    def _assert_supported_key_type(self, ktype):
+        """
+        Check if ktype is one of the supported key types
+
+        :param ktype: the type of the key.
+        :type ktype: subclass of EncryptionKey
+
+        :raise UnsupportedKeyTypeError: if invalid key type
+        """
+        if ktype not in self._wrapper_map:
+            raise UnsupportedKeyTypeError(str(ktype))
+
+
+def _split_email(address):
+    """
+    Split username and domain from an email address
+
+    :param address: an email address
+    :type address: str
+
+    :return: username and domain from the email address
+    :rtype: (str, str)
+    """
+    if address.count("@") != 1:
+        return None
+    return address.split("@")
+
+
+def _get_domain(url):
+    """
+    Get the domain from an url
+
+    :param url: an url
+    :type url: str
+
+    :return: the domain part of the url
+    :rtype: str
+    """
+    return urlparse(url).hostname
