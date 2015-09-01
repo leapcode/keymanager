@@ -1,8 +1,10 @@
 leap-keymanager (0.4.2) unstable; urgency=medium
 
   * Update to 0.4.2 release.
+  * Fix copyright symlink to point to correct GPL version
+  * Update package Description to be more informative
 
- -- Ben Carrillo <ben@futeisha.org>  Fri, 28 Aug 2015 15:44:14 -0400
+ -- Micah Anderson <micah@leap.se>  Tue, 01 Sep 2015 15:44:14 -0400
 
 leap-keymanager (0.3.8) unstable; urgency=low
 
