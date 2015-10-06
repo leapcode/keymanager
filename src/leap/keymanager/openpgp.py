@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # openpgp.py
-# Copyright (C) 2013 LEAP
+# Copyright (C) 2013-2015 LEAP
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import tempfile
+import traceback
 import io
 
 
@@ -41,6 +42,8 @@ from leap.keymanager.keys import (
     TYPE_ADDRESS_PRIVATE_INDEX,
     KEY_ADDRESS_KEY,
     KEY_ID_KEY,
+    KEY_FINGERPRINT_KEY,
+    KEY_REFRESHED_AT_KEY,
     KEYMANAGER_ACTIVE_TYPE,
 )
 
@@ -251,7 +254,7 @@ class OpenPGPScheme(EncryptionScheme):
         leap_assert(is_address(address), 'Not an user address: %s' % address)
 
         def _gen_key(_):
-            with self._temporary_gpgwrapper() as gpg:
+            with TempGPGWrapper(gpgbinary=self._gpgbinary) as gpg:
                 # TODO: inspect result, or use decorator
                 params = gpg.gen_key_input(
                     key_type='RSA',
@@ -321,7 +324,9 @@ class OpenPGPScheme(EncryptionScheme):
                 raise errors.KeyNotFound(address)
             leap_assert(
                 address in doc.content[KEY_ADDRESS_KEY],
-                'Wrong address in key data.')
+                'Wrong address in key %s. Expected %s, found %s.'
+                % (doc.content[KEY_ID_KEY], address,
+                   doc.content[KEY_ADDRESS_KEY]))
             key = build_key_from_dict(OpenPGPKey, doc.content)
             key._gpgbinary = self._gpgbinary
             return key
@@ -346,37 +351,25 @@ class OpenPGPScheme(EncryptionScheme):
         # TODO: add more checks for correct key data.
         leap_assert(key_data is not None, 'Data does not represent a key.')
 
-        with self._temporary_gpgwrapper() as gpg:
-            # TODO: inspect result, or use decorator
-            gpg.import_keys(key_data)
-            privkey = None
-            pubkey = None
+        priv_info, privkey = process_ascii_key(
+            key_data, self._gpgbinary, secret=True)
+        pub_info, pubkey = process_ascii_key(
+            key_data, self._gpgbinary, secret=False)
 
-            try:
-                privkey = gpg.list_keys(secret=True).pop()
-            except IndexError:
-                pass
-            try:
-                pubkey = gpg.list_keys(secret=False).pop()  # unitary keyring
-            except IndexError:
-                return (None, None)
+        if not pubkey:
+            return (None, None)
 
-            openpgp_privkey = None
-            if privkey is not None:
-                # build private key
-                openpgp_privkey = self._build_key_from_gpg(
-                    privkey,
-                    gpg.export_keys(privkey['fingerprint'], secret=True))
-                leap_check(pubkey['fingerprint'] == privkey['fingerprint'],
-                           'Fingerprints for public and private key differ.',
-                           errors.KeyFingerprintMismatch)
+        openpgp_privkey = None
+        if privkey:
+            # build private key
+            openpgp_privkey = self._build_key_from_gpg(priv_info, privkey)
+            leap_check(pub_info['fingerprint'] == priv_info['fingerprint'],
+                       'Fingerprints for public and private key differ.',
+                       errors.KeyFingerprintMismatch)
+        # build public key
+        openpgp_pubkey = self._build_key_from_gpg(pub_info, pubkey)
 
-            # build public key
-            openpgp_pubkey = self._build_key_from_gpg(
-                pubkey,
-                gpg.export_keys(pubkey['fingerprint'], secret=False))
-
-            return (openpgp_pubkey, openpgp_privkey)
+        return (openpgp_pubkey, openpgp_privkey)
 
     def put_ascii_key(self, key_data, address):
         """
@@ -432,41 +425,42 @@ class OpenPGPScheme(EncryptionScheme):
         :rtype: Deferred
         """
         def check_and_put(docs, key):
-            if len(docs) == 1:
-                doc = docs.pop()
-                oldkey = build_key_from_dict(OpenPGPKey, doc.content)
-                if key.fingerprint == oldkey.fingerprint:
-                    # in case of an update of the key merge them with gnupg
-                    with self._temporary_gpgwrapper() as gpg:
-                        gpg.import_keys(oldkey.key_data)
-                        gpg.import_keys(key.key_data)
-                        gpgkey = gpg.list_keys(secret=key.private).pop()
-                        mergedkey = self._build_key_from_gpg(
-                            gpgkey,
-                            gpg.export_keys(gpgkey['fingerprint'],
-                                            secret=key.private))
-                    mergedkey.validation = max(
-                        [key.validation, oldkey.validation])
-                    mergedkey.last_audited_at = oldkey.last_audited_at
-                    mergedkey.refreshed_at = key.refreshed_at
-                    mergedkey.encr_used = key.encr_used or oldkey.encr_used
-                    mergedkey.sign_used = key.sign_used or oldkey.sign_used
-                    doc.set_json(mergedkey.get_json())
-                    d = self._soledad.put_doc(doc)
-                else:
-                    logger.critical(
-                        "Can't put a key whith the same key_id and different "
-                        "fingerprint: %s, %s"
-                        % (key.fingerprint, oldkey.fingerprint))
-                    d = defer.fail(
-                        errors.KeyFingerprintMismatch(key.fingerprint))
+            deferred_repair = defer.succeed(None)
+            if len(docs) == 0:
+                return self._soledad.create_doc_from_json(key.get_json())
             elif len(docs) > 1:
+                deferred_repair = self._repair_key_docs(docs, key.key_id)
+
+            doc = docs[0]
+            oldkey = build_key_from_dict(OpenPGPKey, doc.content)
+            if key.fingerprint != oldkey.fingerprint:
                 logger.critical(
-                    "There is more than one key with the same key_id %s"
-                    % (key.key_id,))
-                d = defer.fail(errors.KeyAttributesDiffer(key.key_id))
-            else:
-                d = self._soledad.create_doc_from_json(key.get_json())
+                    "Can't put a key whith the same key_id and different "
+                    "fingerprint: %s, %s"
+                    % (key.fingerprint, oldkey.fingerprint))
+                return defer.fail(
+                    errors.KeyFingerprintMismatch(key.fingerprint))
+
+            # in case of an update of the key merge them with gnupg
+            with TempGPGWrapper(gpgbinary=self._gpgbinary) as gpg:
+                gpg.import_keys(oldkey.key_data)
+                gpg.import_keys(key.key_data)
+                gpgkey = gpg.list_keys(secret=key.private).pop()
+                mergedkey = self._build_key_from_gpg(
+                    gpgkey,
+                    gpg.export_keys(gpgkey['fingerprint'],
+                                    secret=key.private))
+            mergedkey.validation = max(
+                [key.validation, oldkey.validation])
+            mergedkey.last_audited_at = oldkey.last_audited_at
+            mergedkey.refreshed_at = key.refreshed_at
+            mergedkey.encr_used = key.encr_used or oldkey.encr_used
+            mergedkey.sign_used = key.sign_used or oldkey.sign_used
+            doc.set_json(mergedkey.get_json())
+            deferred_put = self._soledad.put_doc(doc)
+
+            d = defer.gatherResults([deferred_put, deferred_repair])
+            d.addCallback(lambda res: res[0])
             return d
 
         d = self._soledad.get_from_index(
@@ -543,14 +537,21 @@ class OpenPGPScheme(EncryptionScheme):
                 self.KEY_TYPE,
                 key_id,
                 '1' if private else '0')
-            d.addCallback(get_doc, key_id)
+            d.addCallback(get_doc, key_id, activedoc)
             return d
 
-        def get_doc(doclist, key_id):
-            leap_assert(
-                len(doclist) is 1,
-                'There is %d keys for id %s!' % (len(doclist), key_id))
-            return doclist.pop()
+        def get_doc(doclist, key_id, activedoc):
+            if len(doclist) == 0:
+                logger.warning('There is no key for id %s! Self-repairing it.'
+                               % (key_id))
+                d = self._soledad.delete_doc(activedoc)
+                d.addCallback(lambda _: None)
+                return d
+            elif len(doclist) > 1:
+                d = self._repair_key_docs(doclist, key_id)
+                d.addCallback(lambda _: doclist[0])
+                return d
+            return doclist[0]
 
         d = self._soledad.get_from_index(
             TYPE_ADDRESS_PRIVATE_INDEX,
@@ -575,24 +576,7 @@ class OpenPGPScheme(EncryptionScheme):
         :return: An instance of the key.
         :rtype: OpenPGPKey
         """
-        expiry_date = None
-        if key['expires']:
-            expiry_date = datetime.fromtimestamp(int(key['expires']))
-        address = []
-        for uid in key['uids']:
-            address.append(_parse_address(uid))
-
-        return OpenPGPKey(
-            address,
-            gpgbinary=self._gpgbinary,
-            key_id=key['keyid'],
-            fingerprint=key['fingerprint'],
-            key_data=key_data,
-            private=True if key['type'] == 'sec' else False,
-            length=int(key['length']),
-            expiry_date=expiry_date,
-            refreshed_at=datetime.now(),
-        )
+        return build_gpg_key(key, key_data, self._gpgbinary)
 
     def delete_key(self, key):
         """
@@ -625,18 +609,20 @@ class OpenPGPScheme(EncryptionScheme):
         def delete_key(docs):
             if len(docs) == 0:
                 raise errors.KeyNotFound(key)
-            if len(docs) > 1:
-                logger.critical("There is more than one key for key_id %s"
-                                % key.key_id)
+            elif len(docs) > 1:
+                logger.warning("There is more than one key for key_id %s"
+                               % key.key_id)
 
-            doc = None
-            for d in docs:
-                if d.content['fingerprint'] == key.fingerprint:
-                    doc = d
-                    break
-            if doc is None:
+            has_deleted = False
+            deferreds = []
+            for doc in docs:
+                if doc.content['fingerprint'] == key.fingerprint:
+                    d = self._soledad.delete_doc(doc)
+                    deferreds.append(d)
+                    has_deleted = True
+            if not has_deleted:
                 raise errors.KeyNotFound(key)
-            return self._soledad.delete_doc(doc)
+            return defer.gatherResults(deferreds)
 
         d = self._soledad.get_from_index(
             TYPE_ID_PRIVATE_INDEX,
@@ -648,24 +634,39 @@ class OpenPGPScheme(EncryptionScheme):
         d.addCallback(delete_key)
         return d
 
+    def _repair_key_docs(self, doclist, key_id):
+        """
+        If there is more than one key for a key id try to self-repair it
+
+        :return: a Deferred that will be fired once all the deletions are
+                 completed
+        :rtype: Deferred
+        """
+        logger.error("BUG ---------------------------------------------------")
+        logger.error("There is more than one key with the same key_id %s:"
+                     % (key_id,))
+
+        def log_key_doc(doc):
+            logger.error("\t%s: %s" % (doc.content[KEY_ADDRESS_KEY],
+                                       doc.content[KEY_FINGERPRINT_KEY]))
+
+        doclist.sort(key=lambda doc: doc.content[KEY_REFRESHED_AT_KEY],
+                     reverse=True)
+        log_key_doc(doclist[0])
+        deferreds = []
+        for doc in doclist[1:]:
+            log_key_doc(doc)
+            d = self._soledad.delete_doc(doc)
+            deferreds.append(d)
+
+        logger.error("")
+        logger.error(traceback.extract_stack())
+        logger.error("BUG (please report above info) ------------------------")
+        return defer.gatherResults(deferreds, consumeErrors=True)
+
     #
     # Data encryption, decryption, signing and verifying
     #
-
-    def _temporary_gpgwrapper(self, keys=None):
-        """
-        Return a gpg wrapper that implements the context manager protocol and
-        contains C{keys}.
-
-        :param keys: keys to conform the keyring.
-        :type key: list(OpenPGPKey)
-
-        :return: a TempGPGWrapper instance
-        :rtype: TempGPGWrapper
-        """
-        # TODO do here checks on key_data
-        return TempGPGWrapper(
-            keys=keys, gpgbinary=self._gpgbinary)
 
     @staticmethod
     def _assert_gpg_result_ok(result):
@@ -711,7 +712,7 @@ class OpenPGPScheme(EncryptionScheme):
             leap_assert_type(sign, OpenPGPKey)
             leap_assert(sign.private is True)
             keys.append(sign)
-        with self._temporary_gpgwrapper(keys) as gpg:
+        with TempGPGWrapper(keys, self._gpgbinary) as gpg:
             result = gpg.encrypt(
                 data, pubkey.fingerprint,
                 default_key=sign.key_id if sign else None,
@@ -753,7 +754,7 @@ class OpenPGPScheme(EncryptionScheme):
             leap_assert_type(verify, OpenPGPKey)
             leap_assert(verify.private is False)
             keys.append(verify)
-        with self._temporary_gpgwrapper(keys) as gpg:
+        with TempGPGWrapper(keys, self._gpgbinary) as gpg:
             try:
                 result = gpg.decrypt(
                     data, passphrase=passphrase, always_trust=True)
@@ -781,7 +782,7 @@ class OpenPGPScheme(EncryptionScheme):
         :return: Whether C{data} was encrypted using this wrapper.
         :rtype: bool
         """
-        with self._temporary_gpgwrapper() as gpg:
+        with TempGPGWrapper(gpgbinary=self._gpgbinary) as gpg:
             gpgutil = GPGUtilities(gpg)
             return gpgutil.is_encrypted_asym(data)
 
@@ -812,7 +813,7 @@ class OpenPGPScheme(EncryptionScheme):
 
         # result.fingerprint - contains the fingerprint of the key used to
         #                      sign.
-        with self._temporary_gpgwrapper(privkey) as gpg:
+        with TempGPGWrapper(privkey, self._gpgbinary) as gpg:
             result = gpg.sign(data, default_key=privkey.key_id,
                               digest_algo=digest_algo, clearsign=clearsign,
                               detach=detach, binary=binary)
@@ -847,7 +848,7 @@ class OpenPGPScheme(EncryptionScheme):
         """
         leap_assert_type(pubkey, OpenPGPKey)
         leap_assert(pubkey.private is False)
-        with self._temporary_gpgwrapper(pubkey) as gpg:
+        with TempGPGWrapper(pubkey, self._gpgbinary) as gpg:
             result = None
             if detached_sig is None:
                 result = gpg.verify(data)
@@ -865,3 +866,35 @@ class OpenPGPScheme(EncryptionScheme):
             rfprint = result.fingerprint
             kfprint = gpgpubkey['fingerprint']
             return valid and rfprint == kfprint
+
+
+def process_ascii_key(key_data, gpgbinary, secret=False):
+    with TempGPGWrapper(gpgbinary=gpgbinary) as gpg:
+        try:
+            gpg.import_keys(key_data)
+            info = gpg.list_keys(secret=secret).pop()
+            key = gpg.export_keys(info['fingerprint'], secret=secret)
+        except IndexError:
+            info = {}
+            key = None
+    return info, key
+
+
+def build_gpg_key(key_info, key_data, gpgbinary=None):
+    expiry_date = None
+    if key_info['expires']:
+        expiry_date = datetime.fromtimestamp(int(key_info['expires']))
+    address = []
+    for uid in key_info['uids']:
+        address.append(_parse_address(uid))
+
+    return OpenPGPKey(
+        address,
+        gpgbinary=gpgbinary,
+        key_id=key_info['keyid'],
+        fingerprint=key_info['fingerprint'],
+        key_data=key_data,
+        private=True if key_info['type'] == 'sec' else False,
+        length=int(key_info['length']),
+        expiry_date=expiry_date,
+        refreshed_at=datetime.now())
