@@ -18,19 +18,33 @@
 Key Manager is a Nicknym agent for LEAP client.
 """
 # let's do a little sanity check to see if we're using the wrong gnupg
+import fileinput
+import os
 import sys
+import tempfile
+
+from leap.common import ca_bundle
+
+from ._version import get_versions
 
 try:
     from gnupg.gnupg import GPGUtilities
     assert(GPGUtilities)  # pyflakes happy
     from gnupg import __version__ as _gnupg_version
+    if '-' in _gnupg_version:
+        # avoid Parsing it as LegacyVersion, get just
+        # the release numbers:
+        _gnupg_version = _gnupg_version.split('-')[0]
     from pkg_resources import parse_version
+    # We need to make sure that we're not colliding with the infamous
+    # python-gnupg
     assert(parse_version(_gnupg_version) >= parse_version('1.4.0'))
 
 except (ImportError, AssertionError):
     print "*******"
     print "Ooops! It looks like there is a conflict in the installed version "
     print "of gnupg."
+    print "GNUPG_VERSION:", _gnupg_version
     print
     print "Disclaimer: Ideally, we would need to work a patch and propose the "
     print "merge to upstream. But until then do: "
@@ -47,7 +61,7 @@ from twisted.internet import defer
 from urlparse import urlparse
 
 from leap.common.check import leap_assert
-from leap.common.events import emit, catalog
+from leap.common.events import emit_async, catalog
 from leap.common.decorators import memoized_method
 
 from leap.keymanager.errors import (
@@ -57,17 +71,17 @@ from leap.keymanager.errors import (
     UnsupportedKeyTypeError,
     InvalidSignature
 )
-from leap.keymanager.validation import ValidationLevel, can_upgrade
+from leap.keymanager.validation import ValidationLevels, can_upgrade
 
 from leap.keymanager.keys import (
     build_key_from_dict,
     KEYMANAGER_KEY_TAG,
     TAGS_PRIVATE_INDEX,
 )
-from leap.keymanager.openpgp import (
-    OpenPGPKey,
-    OpenPGPScheme,
-)
+from leap.keymanager.openpgp import OpenPGPKey, OpenPGPScheme
+
+__version__ = get_versions()['version']
+del get_versions
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +140,42 @@ class KeyManager(object):
         }
         # the following are used to perform https requests
         self._fetcher = requests
-        self._session = self._fetcher.session()
+        self._combined_ca_bundle = self._create_combined_bundle_file()
+
+    #
+    # destructor
+    #
+
+    def __del__(self):
+        try:
+            created_tmp_combined_ca_bundle = self._combined_ca_bundle not in \
+                [ca_bundle.where(), self._ca_cert_path]
+            if created_tmp_combined_ca_bundle:
+                os.remove(self._combined_ca_bundle)
+        except OSError:
+            pass
 
     #
     # utilities
     #
+
+    def _create_combined_bundle_file(self):
+        leap_ca_bundle = ca_bundle.where()
+
+        if self._ca_cert_path == leap_ca_bundle:
+            return self._ca_cert_path   # don't merge file with itself
+        elif not self._ca_cert_path:
+            return leap_ca_bundle
+
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+
+        with open(tmp_file.name, 'w') as fout:
+            fin = fileinput.input(files=(leap_ca_bundle, self._ca_cert_path))
+            for line in fin:
+                fout.write(line)
+            fin.close()
+
+        return tmp_file.name
 
     def _key_class_from_type(self, ktype):
         """
@@ -167,6 +212,24 @@ class KeyManager(object):
         #     res.headers['content-type'].startswith('application/json'),
         #     'Content-type is not JSON.')
         return res
+
+    def _get_with_combined_ca_bundle(self, uri, data=None):
+        """
+        Send a GET request to C{uri} containing C{data}.
+
+        Instead of using the ca_cert provided on construction time, this
+        version also uses the default certificates shipped with leap.common
+
+        :param uri: The URI of the request.
+        :type uri: str
+        :param data: The body of the request.
+        :type data: dict, str or file
+
+        :return: The response to the request.
+        :rtype: requests.Response
+        """
+        return self._fetcher.get(
+            uri, data=data, verify=self._combined_ca_bundle)
 
     def _put(self, uri, data=None):
         """
@@ -224,10 +287,10 @@ class KeyManager(object):
             if self.OPENPGP_KEY in server_keys:
                 # nicknym server is authoritative for its own domain,
                 # for other domains the key might come from key servers.
-                validation_level = ValidationLevel.Weak_Chain
+                validation_level = ValidationLevels.Weak_Chain
                 _, domain = _split_email(address)
                 if (domain == _get_domain(self._nickserver_uri)):
-                    validation_level = ValidationLevel.Provider_Trust
+                    validation_level = ValidationLevels.Provider_Trust
 
                 d = self.put_raw_key(
                     server_keys['openpgp'],
@@ -277,7 +340,7 @@ class KeyManager(object):
                 self._api_version,
                 self._uid)
             self._put(uri, data)
-            emit(catalog.KEYMANAGER_DONE_UPLOADING_KEYS, self._address)
+            emit_async(catalog.KEYMANAGER_DONE_UPLOADING_KEYS, self._address)
 
         d = self.get_key(
             self._address, ktype, private=False, fetch_remote=False)
@@ -313,33 +376,34 @@ class KeyManager(object):
         leap_assert(
             ktype in self._wrapper_map,
             'Unkown key type: %s.' % str(ktype))
-        emit(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
+        _keys = self._wrapper_map[ktype]
+
+        emit_async(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
 
         def key_found(key):
-            emit(catalog.KEYMANAGER_KEY_FOUND, address)
+            emit_async(catalog.KEYMANAGER_KEY_FOUND, address)
             return key
 
         def key_not_found(failure):
             if not failure.check(KeyNotFound):
                 return failure
 
-            emit(catalog.KEYMANAGER_KEY_NOT_FOUND, address)
+            emit_async(catalog.KEYMANAGER_KEY_NOT_FOUND, address)
 
             # we will only try to fetch a key from nickserver if fetch_remote
             # is True and the key is not private.
             if fetch_remote is False or private is True:
                 return failure
 
-            emit(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
+            emit_async(catalog.KEYMANAGER_LOOKING_FOR_KEY, address)
             d = self._fetch_keys_from_server(address)
             d.addCallback(
-                lambda _:
-                self._wrapper_map[ktype].get_key(address, private=False))
+                lambda _: _keys.get_key(address, private=False))
             d.addCallback(key_found)
             return d
 
         # return key if it exists in local database
-        d = self._wrapper_map[ktype].get_key(address, private=private)
+        d = _keys.get_key(address, private=private)
         d.addCallbacks(key_found, key_not_found)
         return d
 
@@ -385,13 +449,16 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         def signal_finished(key):
-            emit(catalog.KEYMANAGER_FINISHED_KEY_GENERATION, self._address)
+            emit_async(
+                catalog.KEYMANAGER_FINISHED_KEY_GENERATION, self._address)
             return key
 
-        emit(catalog.KEYMANAGER_STARTED_KEY_GENERATION, self._address)
-        d = self._wrapper_map[ktype].gen_key(self._address)
+        emit_async(catalog.KEYMANAGER_STARTED_KEY_GENERATION, self._address)
+
+        d = _keys.gen_key(self._address)
         d.addCallback(signal_finished)
         return d
 
@@ -481,14 +548,15 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         def encrypt(keys):
             pubkey, signkey = keys
-            encrypted = self._wrapper_map[ktype].encrypt(
+            encrypted = _keys.encrypt(
                 data, pubkey, passphrase, sign=signkey,
                 cipher_algo=cipher_algo)
             pubkey.encr_used = True
-            d = self._wrapper_map[ktype].put_key(pubkey, address)
+            d = _keys.put_key(pubkey, address)
             d.addCallback(lambda _: encrypted)
             return d
 
@@ -533,18 +601,21 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         def decrypt(keys):
             pubkey, privkey = keys
-            decrypted, signed = self._wrapper_map[ktype].decrypt(
+            decrypted, signed = _keys.decrypt(
                 data, privkey, passphrase=passphrase, verify=pubkey)
             if pubkey is None:
                 signature = KeyNotFound(verify)
             elif signed:
-                pubkey.sign_used = True
-                d = self._wrapper_map[ktype].put_key(pubkey, address)
-                d.addCallback(lambda _: (decrypted, pubkey))
-                return d
+                signature = pubkey
+                if not pubkey.sign_used:
+                    pubkey.sign_used = True
+                    d = _keys.put_key(pubkey, verify)
+                    d.addCallback(lambda _: (decrypted, signature))
+                    return d
             else:
                 signature = InvalidSignature(
                     'Failed to verify signature with key %s' %
@@ -593,9 +664,10 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         def sign(privkey):
-            return self._wrapper_map[ktype].sign(
+            return _keys.sign(
                 data, privkey, digest_algo=digest_algo, clearsign=clearsign,
                 detach=detach, binary=binary)
 
@@ -631,15 +703,18 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         def verify(pubkey):
-            signed = self._wrapper_map[ktype].verify(
+            signed = _keys.verify(
                 data, pubkey, detached_sig=detached_sig)
             if signed:
-                pubkey.sign_used = True
-                d = self._wrapper_map[ktype].put_key(pubkey, address)
-                d.addCallback(lambda _: pubkey)
-                return d
+                if not pubkey.sign_used:
+                    pubkey.sign_used = True
+                    d = _keys.put_key(pubkey, address)
+                    d.addCallback(lambda _: pubkey)
+                    return d
+                return pubkey
             else:
                 raise InvalidSignature(
                     'Failed to verify signature with key %s' %
@@ -664,7 +739,8 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(type(key))
-        return self._wrapper_map[type(key)].delete_key(key)
+        _keys = self._wrapper_map[type(key)]
+        return _keys.delete_key(key)
 
     def put_key(self, key, address):
         """
@@ -684,7 +760,9 @@ class KeyManager(object):
 
         :raise UnsupportedKeyTypeError: if invalid key type
         """
-        self._assert_supported_key_type(type(key))
+        ktype = type(key)
+        self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
         if address not in key.address:
             return defer.fail(
@@ -699,20 +777,19 @@ class KeyManager(object):
 
         def check_upgrade(old_key):
             if key.private or can_upgrade(key, old_key):
-                return self._wrapper_map[type(key)].put_key(key, address)
+                return _keys.put_key(key, address)
             else:
                 raise KeyNotValidUpgrade(
                     "Key %s can not be upgraded by new key %s"
                     % (old_key.key_id, key.key_id))
 
-        d = self._wrapper_map[type(key)].get_key(address,
-                                                 private=key.private)
+        d = _keys.get_key(address, private=key.private)
         d.addErrback(old_key_not_found)
         d.addCallback(check_upgrade)
         return d
 
     def put_raw_key(self, key, ktype, address,
-                    validation=ValidationLevel.Weak_Chain):
+                    validation=ValidationLevels.Weak_Chain):
         """
         Put raw key bound to address in local storage.
 
@@ -724,7 +801,7 @@ class KeyManager(object):
         :type address: str
         :param validation: validation level for this key
                            (default: 'Weak_Chain')
-        :type validation: ValidationLevel
+        :type validation: ValidationLevels
 
         :return: A Deferred which fires when the key is in the storage, or
                  which fails with KeyAddressMismatch if address doesn't match
@@ -736,7 +813,9 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
-        pubkey, privkey = self._wrapper_map[ktype].parse_ascii_key(key)
+        _keys = self._wrapper_map[ktype]
+
+        pubkey, privkey = _keys.parse_ascii_key(key)
         pubkey.validation = validation
         d = self.put_key(pubkey, address)
         if privkey is not None:
@@ -744,7 +823,7 @@ class KeyManager(object):
         return d
 
     def fetch_key(self, address, uri, ktype,
-                  validation=ValidationLevel.Weak_Chain):
+                  validation=ValidationLevels.Weak_Chain):
         """
         Fetch a public key bound to address from the network and put it in
         local storage.
@@ -757,7 +836,7 @@ class KeyManager(object):
         :type ktype: subclass of EncryptionKey
         :param validation: validation level for this key
                            (default: 'Weak_Chain')
-        :type validation: ValidationLevel
+        :type validation: ValidationLevels
 
         :return: A Deferred which fires when the key is in the storage, or
                  which fails with KeyNotFound: if not valid key on uri or fails
@@ -769,13 +848,19 @@ class KeyManager(object):
         :raise UnsupportedKeyTypeError: if invalid key type
         """
         self._assert_supported_key_type(ktype)
+        _keys = self._wrapper_map[ktype]
 
-        res = self._get(uri)
+        logger.info("Fetch key for %s from %s" % (address, uri))
+        try:
+            res = self._get_with_combined_ca_bundle(uri)
+        except Exception as e:
+            logger.warning("There was a problem fetching key: %s" % (e,))
+            return defer.fail(KeyNotFound(uri))
         if not res.ok:
             return defer.fail(KeyNotFound(uri))
 
         # XXX parse binary keys
-        pubkey, _ = self._wrapper_map[ktype].parse_ascii_key(res.content)
+        pubkey, _ = _keys.parse_ascii_key(res.content)
         if pubkey is None:
             return defer.fail(KeyNotFound(uri))
 
@@ -821,8 +906,3 @@ def _get_domain(url):
     :rtype: str
     """
     return urlparse(url).hostname
-
-
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions

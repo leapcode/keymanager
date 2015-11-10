@@ -18,6 +18,7 @@
 Tests for the Validation Levels
 """
 
+import unittest
 from datetime import datetime
 from twisted.internet.defer import inlineCallbacks
 
@@ -29,12 +30,15 @@ from leap.keymanager.tests import (
     KeyManagerWithSoledadTestCase,
     ADDRESS,
     PUBLIC_KEY,
+    ADDRESS_2,
+    PUBLIC_KEY_2,
+    PRIVATE_KEY_2,
     KEY_FINGERPRINT
 )
-from leap.keymanager.validation import ValidationLevel
+from leap.keymanager.validation import ValidationLevels
 
 
-class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
+class ValidationLevelsTestCase(KeyManagerWithSoledadTestCase):
 
     @inlineCallbacks
     def test_none_old_key(self):
@@ -47,7 +51,7 @@ class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
     def test_cant_upgrade(self):
         km = self._key_manager()
         yield km.put_raw_key(PUBLIC_KEY, OpenPGPKey, ADDRESS,
-                             validation=ValidationLevel.Provider_Trust)
+                             validation=ValidationLevels.Provider_Trust)
         d = km.put_raw_key(UNRELATED_KEY, OpenPGPKey, ADDRESS)
         yield self.assertFailure(d, KeyNotValidUpgrade)
 
@@ -56,7 +60,7 @@ class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
         km = self._key_manager()
         yield km.put_raw_key(PUBLIC_KEY, OpenPGPKey, ADDRESS)
         yield km.put_raw_key(UNRELATED_KEY, OpenPGPKey, ADDRESS,
-                             validation=ValidationLevel.Fingerprint)
+                             validation=ValidationLevels.Fingerprint)
         key = yield km.get_key(ADDRESS, OpenPGPKey, fetch_remote=False)
         self.assertEqual(key.fingerprint, UNRELATED_FINGERPRINT)
 
@@ -73,12 +77,12 @@ class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
         km = self._key_manager()
         yield km.put_raw_key(
             EXPIRED_KEY, OpenPGPKey, ADDRESS,
-            validation=ValidationLevel.Third_Party_Endorsement)
+            validation=ValidationLevels.Third_Party_Endorsement)
         d = km.put_raw_key(
             UNRELATED_KEY,
             OpenPGPKey,
             ADDRESS,
-            validation=ValidationLevel.Provider_Trust)
+            validation=ValidationLevels.Provider_Trust)
         yield self.assertFailure(d, KeyNotValidUpgrade)
 
     @inlineCallbacks
@@ -93,14 +97,14 @@ class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
     def test_not_used(self):
         km = self._key_manager()
         yield km.put_raw_key(UNEXPIRED_KEY, OpenPGPKey, ADDRESS,
-                             validation=ValidationLevel.Provider_Trust)
+                             validation=ValidationLevels.Provider_Trust)
         yield km.put_raw_key(UNRELATED_KEY, OpenPGPKey, ADDRESS,
-                             validation=ValidationLevel.Provider_Endorsement)
+                             validation=ValidationLevels.Provider_Endorsement)
         key = yield km.get_key(ADDRESS, OpenPGPKey, fetch_remote=False)
         self.assertEqual(key.fingerprint, UNRELATED_FINGERPRINT)
 
     @inlineCallbacks
-    def test_used(self):
+    def test_used_with_verify(self):
         TEXT = "some text"
 
         km = self._key_manager()
@@ -114,7 +118,28 @@ class ValidationLevelTestCase(KeyManagerWithSoledadTestCase):
         yield km.verify(TEXT, ADDRESS, OpenPGPKey, detached_sig=signature)
         d = km.put_raw_key(
             UNRELATED_KEY, OpenPGPKey, ADDRESS,
-            validation=ValidationLevel.Provider_Endorsement)
+            validation=ValidationLevels.Provider_Endorsement)
+        yield self.assertFailure(d, KeyNotValidUpgrade)
+
+    @inlineCallbacks
+    def test_used_with_decrypt(self):
+        TEXT = "some text"
+
+        km = self._key_manager()
+        yield km.put_raw_key(UNEXPIRED_KEY, OpenPGPKey, ADDRESS)
+        yield km.put_raw_key(PRIVATE_KEY_2, OpenPGPKey, ADDRESS_2)
+        yield km.encrypt(TEXT, ADDRESS, OpenPGPKey)
+
+        km2 = self._key_manager()
+        yield km2.put_raw_key(UNEXPIRED_PRIVATE, OpenPGPKey, ADDRESS)
+        yield km2.put_raw_key(PUBLIC_KEY_2, OpenPGPKey, ADDRESS_2)
+        encrypted = yield km2.encrypt(TEXT, ADDRESS_2, OpenPGPKey,
+                                      sign=ADDRESS)
+
+        yield km.decrypt(encrypted, ADDRESS_2, OpenPGPKey, verify=ADDRESS)
+        d = km.put_raw_key(
+            UNRELATED_KEY, OpenPGPKey, ADDRESS,
+            validation=ValidationLevels.Provider_Endorsement)
         yield self.assertFailure(d, KeyNotValidUpgrade)
 
     @inlineCallbacks
@@ -339,7 +364,6 @@ X2+l7IOSt+31KQCBFN/VmhTySJOVQC1d2A56lSH2c/DWVClji+x3suzn
 -----END PGP PUBLIC KEY BLOCK-----
 """
 
-
-import unittest
 if __name__ == "__main__":
+    import unittest
     unittest.main()

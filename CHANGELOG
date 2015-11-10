@@ -1,3 +1,21 @@
+0.4.3 Oct 28, 2015:
+  o self-repair the keyring if keys get duplicated. Closes: #7498
+  o catch request exceptions on key fetching. Closes #7410.
+  o Don't repush a public key with different addres
+  o use async events api. Closes #7224.
+  o Use ca_bundle when fetching keys by url.
+  o add logging to fetch_key. Related: #7410.
+  o more verbosity in get_key wrong address log.
+  o don't repush a public key with different address. Related #7420.
+
+0.4.2 Aug 26, 2015:
+  o Style changes.
+  o Tests updates.
+  o Packaging improvements.
+
+0.4.1 Jul 10, 2015:
+  o Remove the dependency on enum34. Closes: #7188.
+
 0.4.0 Jun 8, 2015:
   o Adapt to new events api on leap.common. Related to #5359.
   o Add 'fetch_key' method to fetch keys from a URI. Closes #5932.

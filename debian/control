@@ -7,7 +7,11 @@ Standards-Version: 3.9.6
 
 Package: leap-keymanager
 Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}
+Depends: ${misc:Depends}, ${python:Depends}, gnupg
+Enhances: gnupg
 Description: LEAP's Key Manager
- The Key Manager handles all types of keys to allow for  point-to-point 
- encryption between parties communicating  through LEAP infrastructure.
+ The Key Manager is a trusted user agent that is responsible for storing a
+ database of all the keys for the user, updating these keys, and auditing the
+ endorsements of the user’s own keys. Typically, the key manager will run on the
+ user’s device, but might be running on any device the user chooses to trust.
+
