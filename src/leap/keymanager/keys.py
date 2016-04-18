@@ -28,6 +28,7 @@ except ImportError:
 import logging
 import re
 import time
+import traceback
 
 
 from abc import ABCMeta, abstractmethod
@@ -44,9 +45,10 @@ logger = logging.getLogger(__name__)
 # Dictionary keys used for storing cryptographic keys.
 #
 
+KEY_VERSION_KEY = 'version'
+KEY_UIDS_KEY = 'uids'
 KEY_ADDRESS_KEY = 'address'
 KEY_TYPE_KEY = 'type'
-KEY_ID_KEY = 'key_id'
 KEY_FINGERPRINT_KEY = 'fingerprint'
 KEY_DATA_KEY = 'key_data'
 KEY_PRIVATE_KEY = 'private'
@@ -68,22 +70,26 @@ KEYMANAGER_KEY_TAG = 'keymanager-key'
 KEYMANAGER_ACTIVE_TAG = 'keymanager-active'
 KEYMANAGER_ACTIVE_TYPE = '-active'
 
+# Version of the Soledad Document schema,
+# it should be bumped each time the document format changes
+KEYMANAGER_DOC_VERSION = 1
+
 
 #
 # key indexing constants.
 #
 
 TAGS_PRIVATE_INDEX = 'by-tags-private'
-TYPE_ID_PRIVATE_INDEX = 'by-type-id-private'
+TYPE_FINGERPRINT_PRIVATE_INDEX = 'by-type-fingerprint-private'
 TYPE_ADDRESS_PRIVATE_INDEX = 'by-type-address-private'
 INDEXES = {
     TAGS_PRIVATE_INDEX: [
         KEY_TAGS_KEY,
         'bool(%s)' % KEY_PRIVATE_KEY,
     ],
-    TYPE_ID_PRIVATE_INDEX: [
+    TYPE_FINGERPRINT_PRIVATE_INDEX: [
         KEY_TYPE_KEY,
-        KEY_ID_KEY,
+        KEY_FINGERPRINT_KEY,
         'bool(%s)' % KEY_PRIVATE_KEY,
     ],
     TYPE_ADDRESS_PRIVATE_INDEX: [
@@ -110,39 +116,51 @@ def is_address(address):
     return bool(re.match('[\w.-]+@[\w.-]+', address))
 
 
-def build_key_from_dict(kClass, kdict):
+def build_key_from_dict(kClass, key, active=None):
     """
     Build an C{kClass} key based on info in C{kdict}.
 
-    :param kdict: Dictionary with key data.
-    :type kdict: dict
+    :param key: Dictionary with key data.
+    :type key: dict
+    :param active: Dictionary with active data.
+    :type active: dict
     :return: An instance of the key.
     :rtype: C{kClass}
     """
-    try:
-        validation = ValidationLevels.get(kdict[KEY_VALIDATION_KEY])
-    except ValueError:
-        logger.error("Not valid validation level (%s) for key %s",
-                     (kdict[KEY_VALIDATION_KEY], kdict[KEY_ID_KEY]))
-        validation = ValidationLevels.Weak_Chain
+    address = None
+    validation = ValidationLevels.Weak_Chain
+    last_audited_at = None
+    encr_used = False
+    sign_used = False
 
-    expiry_date = _to_datetime(kdict[KEY_EXPIRY_DATE_KEY])
-    last_audited_at = _to_datetime(kdict[KEY_LAST_AUDITED_AT_KEY])
-    refreshed_at = _to_datetime(kdict[KEY_REFRESHED_AT_KEY])
+    if active:
+        address = active[KEY_ADDRESS_KEY]
+        try:
+            validation = ValidationLevels.get(active[KEY_VALIDATION_KEY])
+        except ValueError:
+            logger.error("Not valid validation level (%s) for key %s",
+                         (active[KEY_VALIDATION_KEY],
+                          active[KEY_FINGERPRINT_KEY]))
+        last_audited_at = _to_datetime(active[KEY_LAST_AUDITED_AT_KEY])
+        encr_used = active[KEY_ENCR_USED_KEY]
+        sign_used = active[KEY_SIGN_USED_KEY]
+
+    expiry_date = _to_datetime(key[KEY_EXPIRY_DATE_KEY])
+    refreshed_at = _to_datetime(key[KEY_REFRESHED_AT_KEY])
 
     return kClass(
-        kdict[KEY_ADDRESS_KEY],
-        key_id=kdict[KEY_ID_KEY],
-        fingerprint=kdict[KEY_FINGERPRINT_KEY],
-        key_data=kdict[KEY_DATA_KEY],
-        private=kdict[KEY_PRIVATE_KEY],
-        length=kdict[KEY_LENGTH_KEY],
+        address=address,
+        uids=key[KEY_UIDS_KEY],
+        fingerprint=key[KEY_FINGERPRINT_KEY],
+        key_data=key[KEY_DATA_KEY],
+        private=key[KEY_PRIVATE_KEY],
+        length=key[KEY_LENGTH_KEY],
         expiry_date=expiry_date,
         last_audited_at=last_audited_at,
         refreshed_at=refreshed_at,
         validation=validation,
-        encr_used=kdict[KEY_ENCR_USED_KEY],
-        sign_used=kdict[KEY_SIGN_USED_KEY],
+        encr_used=encr_used,
+        sign_used=sign_used,
     )
 
 
@@ -174,17 +192,21 @@ class EncryptionKey(object):
 
     __metaclass__ = ABCMeta
 
-    def __init__(self, address, key_id="", fingerprint="",
+    def __init__(self, address=None, uids=[], fingerprint="",
                  key_data="", private=False, length=0, expiry_date=None,
                  validation=ValidationLevels.Weak_Chain, last_audited_at=None,
                  refreshed_at=None, encr_used=False, sign_used=False):
         self.address = address
-        self.key_id = key_id
+        if not uids and address:
+            self.uids = [address]
+        else:
+            self.uids = uids
         self.fingerprint = fingerprint
         self.key_data = key_data
         self.private = private
         self.length = length
         self.expiry_date = expiry_date
+
         self.validation = validation
         self.last_audited_at = last_audited_at
         self.refreshed_at = refreshed_at
@@ -199,40 +221,40 @@ class EncryptionKey(object):
         :rtype: str
         """
         expiry_date = _to_unix_time(self.expiry_date)
-        last_audited_at = _to_unix_time(self.last_audited_at)
         refreshed_at = _to_unix_time(self.refreshed_at)
 
         return json.dumps({
-            KEY_ADDRESS_KEY: self.address,
+            KEY_UIDS_KEY: self.uids,
             KEY_TYPE_KEY: self.__class__.__name__,
-            KEY_ID_KEY: self.key_id,
             KEY_FINGERPRINT_KEY: self.fingerprint,
             KEY_DATA_KEY: self.key_data,
             KEY_PRIVATE_KEY: self.private,
             KEY_LENGTH_KEY: self.length,
             KEY_EXPIRY_DATE_KEY: expiry_date,
-            KEY_LAST_AUDITED_AT_KEY: last_audited_at,
             KEY_REFRESHED_AT_KEY: refreshed_at,
-            KEY_VALIDATION_KEY: str(self.validation),
-            KEY_ENCR_USED_KEY: self.encr_used,
-            KEY_SIGN_USED_KEY: self.sign_used,
+            KEY_VERSION_KEY: KEYMANAGER_DOC_VERSION,
             KEY_TAGS_KEY: [KEYMANAGER_KEY_TAG],
         })
 
-    def get_active_json(self, address):
+    def get_active_json(self):
         """
         Return a JSON string describing this key.
 
-        :param address: Address for wich the key is active
-        :type address: str
         :return: The JSON string describing this key.
         :rtype: str
         """
+        last_audited_at = _to_unix_time(self.last_audited_at)
+
         return json.dumps({
-            KEY_ADDRESS_KEY: address,
+            KEY_ADDRESS_KEY: self.address,
             KEY_TYPE_KEY: self.__class__.__name__ + KEYMANAGER_ACTIVE_TYPE,
-            KEY_ID_KEY: self.key_id,
+            KEY_FINGERPRINT_KEY: self.fingerprint,
             KEY_PRIVATE_KEY: self.private,
+            KEY_VALIDATION_KEY: str(self.validation),
+            KEY_LAST_AUDITED_AT_KEY: last_audited_at,
+            KEY_ENCR_USED_KEY: self.encr_used,
+            KEY_SIGN_USED_KEY: self.sign_used,
+            KEY_VERSION_KEY: KEYMANAGER_DOC_VERSION,
             KEY_TAGS_KEY: [KEYMANAGER_ACTIVE_TAG],
         })
 
@@ -242,7 +264,7 @@ class EncryptionKey(object):
         """
         return u"<%s 0x%s (%s - %s)>" % (
             self.__class__.__name__,
-            self.key_id,
+            self.fingerprint,
             self.address,
             "priv" if self.private else "publ")
 
@@ -270,7 +292,8 @@ class EncryptionScheme(object):
         :type soledad: leap.soledad.Soledad
         """
         self._soledad = soledad
-        self._init_indexes()
+        self.deferred_init = self._init_indexes()
+        self.deferred_init.addCallback(self._migrate_documents_schema)
 
     def _init_indexes(self):
         """
@@ -298,8 +321,14 @@ class EncryptionScheme(object):
                     deferreds.append(d)
             return defer.gatherResults(deferreds, consumeErrors=True)
 
-        self.deferred_indexes = self._soledad.list_indexes()
-        self.deferred_indexes.addCallback(init_idexes)
+        d = self._soledad.list_indexes()
+        d.addCallback(init_idexes)
+        return d
+
+    def _migrate_documents_schema(self, _):
+        from leap.keymanager.migrator import KeyDocumentsMigrator
+        migrator = KeyDocumentsMigrator(self._soledad)
+        return migrator.migrate()
 
     def _wait_indexes(self, *methods):
         """
@@ -332,7 +361,7 @@ class EncryptionScheme(object):
             self.stored[method] = getattr(self, method)
             setattr(self, method, makeWrapper(method))
 
-        self.deferred_indexes.addCallback(restore)
+        self.deferred_init.addCallback(restore)
 
     @abstractmethod
     def get_key(self, address, private=False):
@@ -352,14 +381,12 @@ class EncryptionScheme(object):
         pass
 
     @abstractmethod
-    def put_key(self, key, address):
+    def put_key(self, key):
         """
         Put a key in local storage.
 
         :param key: The key to be stored.
         :type key: EncryptionKey
-        :param address: address for which this key will be active.
-        :type address: str
 
         :return: A Deferred which fires when the key is in the storage.
         :rtype: Deferred
@@ -464,3 +491,68 @@ class EncryptionScheme(object):
         :rtype: bool
         """
         pass
+
+    def _repair_key_docs(self, doclist):
+        """
+        If there is more than one key for a key id try to self-repair it
+
+        :return: a Deferred that will be fired with the valid key doc once all
+                 the deletions are completed
+        :rtype: Deferred
+        """
+        def log_key_doc(doc):
+            logger.error("\t%s: %s" % (doc.content[KEY_UIDS_KEY],
+                                       doc.content[KEY_FINGERPRINT_KEY]))
+
+        def cmp_key(d1, d2):
+            return cmp(d1.content[KEY_REFRESHED_AT_KEY],
+                       d2.content[KEY_REFRESHED_AT_KEY])
+
+        return self._repair_docs(doclist, cmp_key, log_key_doc)
+
+    def _repair_active_docs(self, doclist):
+        """
+        If there is more than one active doc for an address try to self-repair
+        it
+
+        :return: a Deferred that will be fired with the valid active doc once
+                 all the deletions are completed
+        :rtype: Deferred
+        """
+        def log_active_doc(doc):
+            logger.error("\t%s: %s" % (doc.content[KEY_ADDRESS_KEY],
+                                       doc.content[KEY_FINGERPRINT_KEY]))
+
+        def cmp_active(d1, d2):
+            res = cmp(d1.content[KEY_LAST_AUDITED_AT_KEY],
+                      d2.content[KEY_LAST_AUDITED_AT_KEY])
+            if res != 0:
+                return res
+
+            used1 = (d1.content[KEY_SIGN_USED_KEY] +
+                     d1.content[KEY_ENCR_USED_KEY])
+            used2 = (d2.content[KEY_SIGN_USED_KEY] +
+                     d2.content[KEY_ENCR_USED_KEY])
+            return cmp(used1, used2)
+
+        return self._repair_docs(doclist, cmp_active, log_active_doc)
+
+    def _repair_docs(self, doclist, cmp_func, log_func):
+        logger.error("BUG ---------------------------------------------------")
+        logger.error("There is more than one doc of type %s:"
+                     % (doclist[0].content[KEY_TYPE_KEY],))
+
+        doclist.sort(cmp=cmp_func, reverse=True)
+        log_func(doclist[0])
+        deferreds = []
+        for doc in doclist[1:]:
+            log_func(doc)
+            d = self._soledad.delete_doc(doc)
+            deferreds.append(d)
+
+        logger.error("")
+        logger.error(traceback.extract_stack())
+        logger.error("BUG (please report above info) ------------------------")
+        d = defer.gatherResults(deferreds, consumeErrors=True)
+        d.addCallback(lambda _: doclist[0])
+        return d
