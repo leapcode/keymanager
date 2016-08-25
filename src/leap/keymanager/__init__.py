@@ -92,7 +92,7 @@ class KeyManager(object):
 
     def __init__(self, address, nickserver_uri, soledad, token=None,
                  ca_cert_path=None, api_uri=None, api_version=None, uid=None,
-                 gpgbinary=None):
+                 gpgbinary=None, combined_ca_bundle=None):
         """
         Initialize a Key Manager for user's C{address} with provider's
         nickserver reachable in C{nickserver_uri}.
@@ -125,7 +125,7 @@ class KeyManager(object):
         self.api_version = api_version
         self.uid = uid
         self._openpgp = OpenPGPScheme(soledad, gpgbinary=gpgbinary)
-        self._combined_ca_bundle = self._create_combined_bundle_file()
+        self._combined_ca_bundle = combined_ca_bundle or self._create_combined_bundle_file()
         self._async_client = HTTPClient(self._combined_ca_bundle)
         self._nicknym = Nicknym(self._nickserver_uri, self._ca_cert_path, self._token)
         self.refresher = None
