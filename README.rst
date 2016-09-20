@@ -1,5 +1,8 @@
 LEAP's Key Manager
 ==================
+
+**Note**: this repo is **deprecated**. Further development happens at https://0xacab.org/leap/bitmask-dev
+
 .. image:: https://badge.fury.io/py/leap.keymanager.svg
     :target: http://badge.fury.io/py/leap.keymanager
 .. image:: https://img.shields.io/pypi/dm/leap.keymanager.svg
