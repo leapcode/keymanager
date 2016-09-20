@@ -131,19 +131,6 @@ class KeyManager(object):
         self.refresher = None
 
     #
-    # destructor
-    #
-
-    def __del__(self):
-        try:
-            created_tmp_combined_ca_bundle = self._combined_ca_bundle not in \
-                [ca_bundle.where(), self._ca_cert_path]
-            if created_tmp_combined_ca_bundle:
-                os.remove(self._combined_ca_bundle)
-        except OSError:
-            pass
-
-    #
     # utilities
     #
 

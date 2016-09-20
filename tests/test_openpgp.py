@@ -23,16 +23,13 @@ Tests for the OpenPGP support on Key Manager.
 
 from datetime import datetime
 from mock import Mock
-from twisted.internet.defer import inlineCallbacks, gatherResults, succeed
+from twisted.internet.defer import inlineCallbacks, succeed
 
 from leap.keymanager import (
     KeyNotFound,
     openpgp,
 )
-from leap.keymanager.documents import (
-    TYPE_FINGERPRINT_PRIVATE_INDEX,
-    TYPE_ADDRESS_PRIVATE_INDEX,
-)
+from leap.keymanager.documents import TYPE_FINGERPRINT_PRIVATE_INDEX
 from leap.keymanager.keys import OpenPGPKey
 
 from common import (
